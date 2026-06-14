@@ -1,60 +1,253 @@
 // Package hdx is the library behind the hdx command line:
-// the HTTP client, request shaping, and the typed data models for hdx.
+// the HTTP client, request shaping, and the typed data models for the
+// Humanitarian Data Exchange (HDX) API.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// HDX (data.humdata.org) is a CKAN-based open humanitarian data platform run
+// by OCHA. Every action endpoint lives under /api/action/<name> and returns
+// {"success": true, "result": <payload>}. No API key or cookie required.
+//
+// The Client sets a real User-Agent, paces requests so a busy session stays
+// polite, and retries transient failures (429 and 5xx).
 package hdx
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to hdx. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "hdx/dev (+https://github.com/tamnd/hdx-cli)"
+// DefaultUserAgent identifies the client to HDX.
+const DefaultUserAgent = "hdx-cli/0.1 (tamnd87@gmail.com)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at hdx.com; change it once you
-// know the real endpoints you want to read.
-const Host = "hdx.com"
+// Host is the HDX site hostname.
+const Host = "data.humdata.org"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// BaseURL is the CKAN API root every request is built from.
+const BaseURL = "https://data.humdata.org/api/action"
 
-// Client talks to hdx over HTTP.
+// --- wire types ---
+
+type wireCKANResult[T any] struct {
+	Success bool `json:"success"`
+	Result  T    `json:"result"`
+}
+
+type wireSearchResult[T any] struct {
+	Count   int `json:"count"`
+	Results []T `json:"results"`
+}
+
+type wirePackage struct {
+	Name             string         `json:"name"`
+	Title            string         `json:"title"`
+	Notes            string         `json:"notes"`
+	Organization     wireOrg        `json:"organization"`
+	Resources        []wireResource `json:"resources"`
+	Tags             []wireTag      `json:"tags"`
+	MetadataModified string         `json:"metadata_modified"`
+	NumResources     int            `json:"num_resources"`
+}
+
+type wireOrg struct {
+	Name  string `json:"name"`
+	Title string `json:"title"`
+}
+
+type wireResource struct {
+	Name        string          `json:"name"`
+	Format      string          `json:"format"`
+	URL         string          `json:"url"`
+	Description string          `json:"description"`
+	Size        json.RawMessage `json:"size"` // number or string in the wild
+}
+
+type wireTag struct {
+	Name string `json:"name"`
+}
+
+type wireOrgItem struct {
+	Name         string `json:"name"`
+	Title        string `json:"title"`
+	PackageCount int    `json:"package_count"`
+}
+
+// --- output record types ---
+
+// Dataset is one search result record.
+type Dataset struct {
+	Name         string `kit:"id" json:"name"`
+	Title        string `json:"title"`
+	Organization string `json:"organization"`
+	Resources    int    `json:"resources"`
+	Modified     string `json:"modified"`
+	Tags         string `json:"tags"` // comma-joined first 3 tags
+}
+
+// Package is the summary record for a dataset.
+type Package struct {
+	Name         string `kit:"id" json:"name"`
+	Title        string `json:"title"`
+	Organization string `json:"organization"`
+	Description  string `json:"description"` // truncated notes
+	Modified     string `json:"modified"`
+	Resources    int    `json:"resources"`
+}
+
+// Resource is one file attached to a dataset.
+type Resource struct {
+	Name        string `kit:"id" json:"name"`
+	Format      string `json:"format"`
+	URL         string `json:"url" table:"url,url"`
+	Description string `json:"description"`
+}
+
+// Organization is one HDX contributing organization.
+type Organization struct {
+	Name         string `kit:"id" json:"name"`
+	Title        string `json:"title"`
+	PackageCount int    `json:"package_count"`
+}
+
+// --- client ---
+
+// Client talks to the HDX CKAN API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
+	// Rate is the minimum gap between requests.
 	Rate    time.Duration
 	Retries int
 
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: 30s timeout, 300ms
+// minimum gap between requests, and 3 retries on transient errors.
 func NewClient() *Client {
 	return &Client{
 		HTTP:      &http.Client{Timeout: 30 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
+// SearchDatasets searches HDX datasets by keyword. org filters by organization
+// name slug if non-empty.
+func (c *Client) SearchDatasets(ctx context.Context, query string, limit int, org string) ([]*Dataset, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	u := BaseURL + "/package_search?q=" + url.QueryEscape(query) +
+		fmt.Sprintf("&rows=%d", limit) +
+		"&sort=score+desc"
+	if org != "" {
+		u += "&fq=organization:" + url.QueryEscape(org)
+	}
+
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+
+	var env wireCKANResult[wireSearchResult[wirePackage]]
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("decode package_search: %w", err)
+	}
+	if !env.Success {
+		return nil, fmt.Errorf("package_search returned success=false")
+	}
+
+	var out []*Dataset
+	for _, wp := range env.Result.Results {
+		out = append(out, &Dataset{
+			Name:         wp.Name,
+			Title:        wp.Title,
+			Organization: wp.Organization.Title,
+			Resources:    wp.NumResources,
+			Modified:     shortDate(wp.MetadataModified),
+			Tags:         joinTags(wp.Tags, 3),
+		})
+	}
+	return out, nil
+}
+
+// GetPackage fetches a single dataset by name/slug and returns the summary
+// record plus all resource records.
+func (c *Client) GetPackage(ctx context.Context, name string) (*Package, []*Resource, error) {
+	u := BaseURL + "/package_show?id=" + url.QueryEscape(name)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var env wireCKANResult[wirePackage]
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, nil, fmt.Errorf("decode package_show: %w", err)
+	}
+	if !env.Success {
+		return nil, nil, fmt.Errorf("package_show returned success=false")
+	}
+
+	wp := env.Result
+	pkg := &Package{
+		Name:         wp.Name,
+		Title:        wp.Title,
+		Organization: wp.Organization.Title,
+		Description:  truncate(wp.Notes, 200),
+		Modified:     shortDate(wp.MetadataModified),
+		Resources:    wp.NumResources,
+	}
+
+	var resources []*Resource
+	for _, wr := range wp.Resources {
+		resources = append(resources, &Resource{
+			Name:        wr.Name,
+			Format:      wr.Format,
+			URL:         wr.URL,
+			Description: wr.Description,
+		})
+	}
+	return pkg, resources, nil
+}
+
+// ListOrganizations returns HDX organizations.
+func (c *Client) ListOrganizations(ctx context.Context, limit int) ([]*Organization, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := fmt.Sprintf("%s/organization_list?all_fields=true&limit=%d", BaseURL, limit)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+
+	var env wireCKANResult[[]wireOrgItem]
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("decode organization_list: %w", err)
+	}
+	if !env.Success {
+		return nil, fmt.Errorf("organization_list returned success=false")
+	}
+
+	var out []*Organization
+	for _, wo := range env.Result {
+		out = append(out, &Organization{
+			Name:         wo.Name,
+			Title:        wo.Title,
+			PackageCount: wo.PackageCount,
+		})
+	}
+	return out, nil
+}
+
+// Get fetches rawURL and returns the response body. It paces and retries
+// according to the client's settings.
 func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
@@ -124,110 +317,34 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on hdx.com. It is a stand-in for the typed records you
-// will model from the real hdx endpoints.
-//
-// The kit struct tags make it addressable as a resource URI (see domain.go): ID
-// is the URI id, and Body is the long text `hdx cat` and the Markdown
-// export print. The table tags shape the terminal grid (`-o table`) without
-// touching the JSON: URL is flagged the canonical column the `url` format prints,
-// and Body is hidden from the grid with `table:"-"` because a long preview wrecks
-// a row, though it still rides in `-o json` and `hdx cat`. Swap `-` for
-// `table:"body,truncate"` if you would rather clip it to the terminal width.
-type Page struct {
-	ID    string `json:"id" kit:"id" table:"id"`
-	URL   string `json:"url" table:"url,url"`
-	Title string `json:"title,omitempty" table:"title"`
-	Body  string `json:"body,omitempty" kit:"body" table:"-"`
-}
+// --- helpers ---
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-// Search fetches the site's search results for query and returns the matching
-// pages as stubs, the same shape PageLinks emits, so every hit is an addressable
-// hdx.com page URI a host can follow. Like the rest of the scaffold it is a
-// stand-in: it reads the links out of a results page rather than a real search
-// API. Point it at the real endpoint and parse the real result shape once you
-// know it.
-func (c *Client) Search(ctx context.Context, query string, limit int) ([]*Page, error) {
-	body, err := c.Get(ctx, BaseURL+"/search?q="+url.QueryEscape(query))
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// shortDate trims a datetime string like "2024-01-15T10:00:00.000000" to
+// just the date "2024-01-15".
+func shortDate(s string) string {
+	if i := strings.Index(s, "T"); i > 0 {
+		return s[:i]
 	}
 	return s
+}
+
+// truncate shortens s to at most n bytes, appending "..." if it was cut.
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// joinTags returns up to max tags comma-joined.
+func joinTags(tags []wireTag, max int) string {
+	var names []string
+	for i, t := range tags {
+		if i >= max {
+			break
+		}
+		names = append(names, t.Name)
+	}
+	return strings.Join(names, ", ")
 }
